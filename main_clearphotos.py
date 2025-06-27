@@ -6,12 +6,17 @@ import numpy as np
 import io
 import csv
 import re
+from datetime import datetime
 
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+tesseract_path = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
 try:
+    pytesseract.pytesseract.tesseract_cmd = tesseract_path
     pytesseract.get_tesseract_version()
 except pytesseract.TesseractNotFoundError:
-    st.error("Tesseract OCR engine not found. Please ensure it is installed and in your PATH.")
+    st.error(f"Tesseract OCR engine not found at '{tesseract_path}'.")
+    st.error("Please ensure it is installed and the path is correct, or added to your system's PATH environment variables.")
     st.stop()
 
 # --- Constants ---
@@ -22,18 +27,17 @@ REFERENCE_HEIGHT = 818 # Standard height for good aspect ratio with 1280 width
 def preprocess_image(image_bytes,
                      target_dims=None,
                      grayscale=True,
-                     brightness_factor=1.0,
-                     contrast_factor=1.0,
+                     brightness_factor=1.10,
+                     contrast_factor=1.40,
                      sharpen_intensity=0,
                      bilateral_filter=False,
-                     deskew=False,
-                     threshold_type='adaptive_gaussian', # Default to adaptive gaussian as it's often robust
-                     noise_reduction_type='median_blur', # Default to median blur
+                     deskew_angle=0.0, # Pass detected angle here
+                     threshold_type='adaptive_gaussian',
+                     noise_reduction_type='median_blur',
                      morph_open=False,
                      morph_close=False,
                      scale_factor=1.0,
-                     contrast_enhance=False,
-                     angle_detected=0.0):
+                     contrast_enhance=False):
     """
     Applies a series of image preprocessing techniques based on provided parameters.
     Returns two versions of the processed image: one optimized for OCR and one for display.
@@ -53,71 +57,113 @@ def preprocess_image(image_bytes,
     if scale_factor != 1.0:
         img = cv2.resize(img, None, fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_CUBIC)
 
-    # Convert to grayscale early if requested, affects subsequent operations
-    if grayscale and len(img.shape) == 3:
+    # Convert to grayscale early if requested for OCR, affects subsequent operations
+    # Create copies for OCR and display paths
+    if grayscale:
         img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        processed_image_for_ocr_cv2 = img_gray.copy()
+        processed_image_for_display_cv2 = img_gray.copy() # Display also grayscale if selected
     else:
-        img_gray = img.copy() # Use as is if not converting to grayscale or already grayscale
-
-    # Initialize separate images for OCR and display from current state
-    # Both will undergo initial enhancements, but binarization only for OCR
-    processed_image_for_ocr_cv2 = img_gray.copy()
-    processed_image_for_display_cv2 = img.copy() # Keep color for display if not explicitly grayscale
+        processed_image_for_ocr_cv2 = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) # OCR always gets grayscale
+        processed_image_for_display_cv2 = img.copy() # Display gets color if selected
 
     # Ensure images are uint8 type
-    if processed_image_for_ocr_cv2.dtype != np.uint8:
-        processed_image_for_ocr_cv2 = processed_image_for_ocr_cv2.astype(np.uint8)
-    if processed_image_for_display_cv2.dtype != np.uint8:
-        processed_image_for_display_cv2 = processed_image_for_display_cv2.astype(np.uint8)
+    processed_image_for_ocr_cv2 = processed_image_for_ocr_cv2.astype(np.uint8)
+    processed_image_for_display_cv2 = processed_image_for_display_cv2.astype(np.uint8)
 
     # Brightness and Contrast (applied to both)
-    # Using cv2.convertScaleAbs which handles both alpha (contrast) and beta (brightness)
+    # Convert display image to BGR for correct contrast/brightness if it's currently grayscale and 'grayscale' is false
+    if not grayscale and len(processed_image_for_display_cv2.shape) == 2:
+        processed_image_for_display_cv2 = cv2.cvtColor(processed_image_for_display_cv2, cv2.COLOR_GRAY2BGR)
+
     processed_image_for_ocr_cv2 = cv2.convertScaleAbs(processed_image_for_ocr_cv2, alpha=contrast_factor, beta=(brightness_factor - 1) * 127)
     processed_image_for_display_cv2 = cv2.convertScaleAbs(processed_image_for_display_cv2, alpha=contrast_factor, beta=(brightness_factor - 1) * 127)
+
 
     # Noise Reduction (applied to both)
     if noise_reduction_type == 'median_blur':
         processed_image_for_ocr_cv2 = cv2.medianBlur(processed_image_for_ocr_cv2, 5)
-        processed_image_for_display_cv2 = cv2.medianBlur(processed_image_for_display_cv2, 5)
+        # For display, apply median blur to each channel if color
+        if len(processed_image_for_display_cv2.shape) == 3:
+            processed_image_for_display_cv2 = cv2.medianBlur(processed_image_for_display_cv2, 5)
+        else:
+            processed_image_for_display_cv2 = cv2.medianBlur(processed_image_for_display_cv2, 5)
     elif noise_reduction_type == 'fast_n_means':
         if len(processed_image_for_ocr_cv2.shape) == 2: # Grayscale
             processed_image_for_ocr_cv2 = cv2.fastNlMeansDenoising(processed_image_for_ocr_cv2, None, h=30, templateWindowSize=7, searchWindowSize=21)
+        else: # Color - should not happen for OCR image at this stage
+            st.warning("OCR image was not grayscale for Fast N-Means. Denoising skipped for OCR.")
+
+        if len(processed_image_for_display_cv2.shape) == 2: # Grayscale display
             processed_image_for_display_cv2 = cv2.fastNlMeansDenoising(processed_image_for_display_cv2, None, h=30, templateWindowSize=7, searchWindowSize=21)
-        else: # Color
-            processed_image_for_ocr_cv2 = cv2.fastNlMeansDenoisingColored(processed_image_for_ocr_cv2, None, hColor=30, h=30, templateWindowSize=7, searchWindowSize=21)
+        else: # Color display
             processed_image_for_display_cv2 = cv2.fastNlMeansDenoisingColored(processed_image_for_display_cv2, None, hColor=30, h=30, templateWindowSize=7, searchWindowSize=21)
 
-    # Bilateral Filter (applied to both, only if grayscale)
-    if bilateral_filter and len(processed_image_for_ocr_cv2.shape) == 2:
-        processed_image_for_ocr_cv2 = cv2.bilateralFilter(processed_image_for_ocr_cv2, 9, 75, 75)
-        processed_image_for_display_cv2 = cv2.bilateralFilter(processed_image_for_display_cv2, 9, 75, 75)
 
-    # Contrast Enhancement (CLAHE) (applied to both, only if grayscale)
-    if contrast_enhance and len(processed_image_for_ocr_cv2.shape) == 2:
+    # Bilateral Filter (applied to both, only if grayscale)
+    if bilateral_filter:
+        if len(processed_image_for_ocr_cv2.shape) == 2:
+            processed_image_for_ocr_cv2 = cv2.bilateralFilter(processed_image_for_ocr_cv2, 9, 75, 75)
+        else:
+            st.warning("OCR image was not grayscale for Bilateral Filter. Filtering skipped for OCR.")
+
+        if len(processed_image_for_display_cv2.shape) == 2:
+            processed_image_for_display_cv2 = cv2.bilateralFilter(processed_image_for_display_cv2, 9, 75, 75)
+        else: # For color image, apply to each channel or convert to LAB and apply to L channel
+            lab = cv2.cvtColor(processed_image_for_display_cv2, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            l_filtered = cv2.bilateralFilter(l, 9, 75, 75)
+            processed_image_for_display_cv2 = cv2.cvtColor(cv2.merge([l_filtered, a, b]), cv2.COLOR_LAB2BGR)
+
+
+    # Contrast Enhancement (CLAHE) - FIX FOR CV2.ERROR
+    if contrast_enhance:
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        processed_image_for_ocr_cv2 = clahe.apply(processed_image_for_ocr_cv2)
-        processed_image_for_display_cv2 = clahe.apply(processed_image_for_display_cv2)
-    
+
+        # Apply CLAHE to the OCR image (which should always be grayscale at this point)
+        if len(processed_image_for_ocr_cv2.shape) == 2: # Ensure it's grayscale
+            processed_image_for_ocr_cv2 = clahe.apply(processed_image_for_ocr_cv2)
+        else:
+            # Fallback if OCR image is unexpectedly not grayscale, convert temporarily
+            st.warning("OCR image was not grayscale for CLAHE. Converting temporarily for OCR.")
+            temp_gray_ocr = cv2.cvtColor(processed_image_for_ocr_cv2, cv2.COLOR_BGR2GRAY)
+            processed_image_for_ocr_cv2 = clahe.apply(temp_gray_ocr)
+
+        # Apply CLAHE to the display image
+        if len(processed_image_for_display_cv2.shape) == 2: # If it's already grayscale
+            processed_image_for_display_cv2 = clahe.apply(processed_image_for_display_cv2)
+        else: # If it's a color image (BGR), convert to LAB and apply CLAHE to L channel
+            lab = cv2.cvtColor(processed_image_for_display_cv2, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            l_clahe = clahe.apply(l)
+            merged_lab = cv2.merge([l_clahe, a, b])
+            processed_image_for_display_cv2 = cv2.cvtColor(merged_lab, cv2.COLOR_LAB2BGR)
+
+
     # Sharpening (applied to both)
     if sharpen_intensity > 0:
         K = sharpen_intensity
-        # A common sharpening kernel
         kernel = np.array([[0, -K, 0],
                            [-K, 1 + 4 * K, -K],
                            [0, -K, 0]], dtype=np.float32)
         processed_image_for_ocr_cv2 = cv2.filter2D(processed_image_for_ocr_cv2, -1, kernel)
-        processed_image_for_display_cv2 = cv2.filter2D(processed_image_for_display_cv2, -1, kernel)
+        
+        if len(processed_image_for_display_cv2.shape) == 3: # Color image
+            processed_image_for_display_cv2 = cv2.filter2D(processed_image_for_display_cv2, -1, kernel)
+        else: # Grayscale image
+            processed_image_for_display_cv2 = cv2.filter2D(processed_image_for_display_cv2, -1, kernel)
 
-    # Deskew (applied to both)
-    if deskew and angle_detected != 0.0:
+
+    # Deskew (applied to both if angle is non-zero)
+    if deskew_angle != 0.0:
         (h, w) = processed_image_for_ocr_cv2.shape[:2]
         center = (w // 2, h // 2)
-        M = cv2.getRotationMatrix2D(center, angle_detected, 1.0)
+        M = cv2.getRotationMatrix2D(center, deskew_angle, 1.0)
         processed_image_for_ocr_cv2 = cv2.warpAffine(processed_image_for_ocr_cv2, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-        # If display image is color, rotate color channels too
-        if len(processed_image_for_display_cv2.shape) == 3:
+        
+        if len(processed_image_for_display_cv2.shape) == 3: # If display image is color
             processed_image_for_display_cv2 = cv2.warpAffine(processed_image_for_display_cv2, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-        else: # If display image is grayscale, rotate it as well
+        else: # If display image is grayscale
             processed_image_for_display_cv2 = cv2.warpAffine(processed_image_for_display_cv2, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
 
     # Final Thresholding for OCR (only applied to the OCR specific image, and only if grayscale)
@@ -141,62 +187,58 @@ def preprocess_image(image_bytes,
     if grayscale and len(processed_image_for_display_cv2.shape) == 3:
         processed_image_for_display_cv2 = cv2.cvtColor(processed_image_for_display_cv2, cv2.COLOR_BGR2GRAY)
     elif not grayscale and len(processed_image_for_display_cv2.shape) == 2:
+        # If display was grayscale earlier but 'grayscale' is now false, convert back to BGR
         processed_image_for_display_cv2 = cv2.cvtColor(processed_image_for_display_cv2, cv2.COLOR_GRAY2BGR)
+
 
     return processed_image_for_ocr_cv2, processed_image_for_display_cv2
 
 
 # --- MRZ Parsing and Cleaning Functions ---
-def clean_mrz_line(line):
+def clean_mrz_line_basic(line):
     """
-    Aggressively replaces common OCR misreads for '<' and other specific characters,
-    then filters to allowed MRZ characters.
+    Cleans an MRZ line by keeping only allowed characters and handling common OCR errors.
+    This version is less aggressive in character replacement to avoid introducing errors
+    if Tesseract's initial read was correct.
     """
-    # Define replacements for common OCR errors. This map is case-insensitive.
-    replacements = {
-        'K': '<', 'S': '<', '5': '<', '6': '<', 'G': '<',
-        'E': '<', 'B': '<', 'Z': '<', '2': '<', 'Q': '<',
-        '|': '<', '/': '<', '\\': '<', '(': '<', ')': '<', '[': '<', ']': '<', '{': '<', '}': '<',
-        ' ': '<', '_': '<', '-': '<', # Replace spaces/underscores/hyphens with filler if in MRZ context
-        'O': '0', 'D': '0', 'I': '1', 'L': '1', # Common number/letter confusions
-    }
-    
     # Allowed characters in MRZ (uppercase letters, digits, and '<')
     allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<")
     
+    # Common OCR confusions that are relatively safe to correct
+    replacements = {
+        'O': '0', 'D': '0', 'I': '1', 'L': '1',
+        'Z': '2', 'S': '5', 'G': '6', 'B': '8',
+        ' ': '<', '_': '<', '-': '<', # Replace spaces/underscores/hyphens with filler if in MRZ context
+    }
+    
     cleaned_chars = []
-    for c in line.strip().upper(): # Process uppercase and strip initial/final whitespace
+    for c in line.strip().upper():
         if c in allowed:
             cleaned_chars.append(c)
         elif c in replacements:
             cleaned_chars.append(replacements[c])
-        # Characters not in allowed or replacements are dropped
+        # Discard characters not in allowed or common replacements
     
     cleaned = "".join(cleaned_chars)
-    
-
-
     return cleaned
-
 
 def parse_mrz_td3(mrz_full_raw_text):
     """
     Parses a TD3 (Passport) MRZ string into its constituent fields.
     This function expects a two-line MRZ format (44 characters per line).
+    It includes more robust cleaning and validation.
     """
     parsed_data = {
         "MRZ Raw": mrz_full_raw_text,
         "Parse Status": "Failed",
-        "type": "N/A",
-        "code": "N/A",
-        "surname": "N/A",
-        "Given names": "N/A",
-        "passport-code": "N/A",
+        "Document Type": "N/A",
+        "Surname": "N/A",
+        "Given Names": "N/A",
+        "Passport Number": "N/A",
     }
 
     # Clean and split lines
-    # Split by newline, filter out empty strings, and clean each line
-    lines = [clean_mrz_line(line) for line in mrz_full_raw_text.strip().split('\n') if line.strip()]
+    lines = [clean_mrz_line_basic(line) for line in mrz_full_raw_text.strip().split('\n') if line.strip()]
 
     line1 = ""
     line2 = ""
@@ -213,62 +255,50 @@ def parse_mrz_td3(mrz_full_raw_text):
         return parsed_data
     
     # Pad to exactly 44 characters (crucial for precise slicing according to TD3 standard)
-    line1 = line1.ljust(44, '<')[:44] # Pad with '<' and then truncate if too long
-    line2 = line2.ljust(44, '<')[:44] # Pad with '<' and then truncate if too long
-
-    
-    if len(line2) == 44:
-        # Extract the fixed beginning (chars 0-27)
-        fixed_beginning = line2[:28]
-        
-        # Define the expected filler segment (14 '<' characters)
-        expected_filler_segment = '<' * 14
-        
-        # Extract the final two characters (chars 42-43)
-        final_two_chars = line2[42:44] 
-
-        # Reconstruct line2: fixed_beginning + expected_filler_segment + final_two_chars
-        line2 = fixed_beginning + expected_filler_segment + final_two_chars
-
-       
-        if line2[42:44] != '02':
-            line2 = line2[:42] + '02' # Force '02'
+    line1 = line1.ljust(44, '<')[:44]
+    line2 = line2.ljust(44, '<')[:44]
 
     parsed_data["MRZ Raw"] = line1 + "\n" + line2 # Update MRZ Raw with cleaned and re-formatted lines
 
     try:
         # Line 1 Parsing
-        # Type of document (1 char) - e.g., 'P' for Passport
-        parsed_data["type"] = line1[0].replace('<', '').strip()
+        parsed_data["Document Type"] = line1[0]
 
-        # Issuing State / Country Code (3 chars) - e.g., 'GBR'
-        parsed_data["code"] = line1[2:5].replace('<', '').strip().ljust(3, '<')[:3]
 
-        # Name parsing (Surname and Given Names)
-        name_segment = line1[5:44] # Takes the next 39 characters for name
-
+        name_segment = line1[5:44]
         if '<<' in name_segment:
-            surname_raw, given_names_raw = name_segment.split('<<', 1) # Split only on the first '<<'
-            parsed_data["surname"] = re.sub(r'\s+', ' ', surname_raw.replace('<', ' ').strip())
-            parsed_data["Given names"] = re.sub(r'\s+', ' ', given_names_raw.replace('<', ' ').strip())
+            surname_raw, given_names_raw = name_segment.split('<<', 1)
+            parsed_data["Surname"] = re.sub(r'<+', ' ', surname_raw).strip()
+            parsed_data["Given Names"] = re.sub(r'<+', ' ', given_names_raw).strip()
         else:
-            parsed_data["surname"] = re.sub(r'\s+', ' ', name_segment.replace('<', ' ').strip())
-            parsed_data["Given names"] = "N/A"
+            parsed_data["Surname"] = re.sub(r'<+', ' ', name_segment).strip()
+            parsed_data["Given Names"] = "N/A"
 
         # Line 2 Parsing
-        # Document Number (Passport Code) - 9 characters
-        passport_code_raw = line2[0:9].replace('<', '').strip()
-        passport_code_clean = re.sub(r'[^0-9A-Z]', '', passport_code_raw) # Allow digits and letters
-        parsed_data["passport-code"] = passport_code_clean
+        parsed_data["Passport Number"] = line2[0:9].replace('<', '').strip()
+        
+        # Check digit for Passport Number (char 9) - not stored as a field, but used for validation
+        passport_num_check_digit = line2[9]
+
+        parsed_data["Nationality"] = line2[10:13]
+        
+        # Date of Birth (YYMMDD) and its check digit
+        dob_check_digit = line2[19]
+
+        
         
         # Determine parse status
-        essential_fields = [parsed_data["type"], parsed_data["code"], parsed_data["surname"], parsed_data["passport-code"]]
-        if all(field not in ["N/A", "", "<<<"] for field in essential_fields): # Check for common filler values too
+        essential_fields = [
+        
+            parsed_data["Surname"], parsed_data["Passport Number"],
+        ]
+        
+        if all(field not in ["N/A", "", "<", "<<", "<<<"] for field in essential_fields):
             parsed_data["Parse Status"] = "Success"
         else:
-            missing_fields = [k for k, v in parsed_data.items() if k in ["type", "code", "surname", "passport-code"] and v in ["N/A", "", "<<<"]]
+            missing_fields = [k for k, v in parsed_data.items() if k in ["Document Type", "Surname", "Passport Number"] and v in ["N/A", "", "<", "<<", "<<<"]]
             if missing_fields:
-                parsed_data["Parse Status"] = f"Partial Success: Missing/Empty fields: {', '.join(missing_fields)}"
+                parsed_data["Parse Status"] = f"Partial Success: Missing/Empty core fields: {', '.join(missing_fields)}"
             else:
                 parsed_data["Parse Status"] = "Partial Success: Some fields might need review."
 
@@ -278,6 +308,53 @@ def parse_mrz_td3(mrz_full_raw_text):
         parsed_data["Parse Status"] = f"Failed: General parsing error: {e}. Raw: '{mrz_full_raw_text}'"
     
     return parsed_data
+
+def parse_dob(dob_text):
+    """
+    Attempts to parse various date formats into a standardized 'DD MONYYYY' format.
+    Prioritizes YYMMDD (MRZ format), then common free-form formats.
+    """
+    dob_text = dob_text.strip().replace(' ', '').upper()
+
+    # Try YYMMDD format first (e.g., 850117) - common in MRZ
+    if len(dob_text) == 6 and dob_text.isdigit():
+        try:
+            # Heuristic for 2-digit years: if > current year % 100, assume 19xx, else 20xx
+            current_year_last_two_digits = datetime.now().year % 100
+            year_prefix = '19' if int(dob_text[0:2]) > current_year_last_two_digits else '20'
+            full_year_str = year_prefix + dob_text[0:2]
+            return datetime.strptime(full_year_str + dob_text[2:6], "%Y%m%d").strftime("%d %b %Y").upper()
+        except ValueError:
+            pass # Continue to next format
+
+    # Try DD MONYYYY (e.g., 17 JAN 1985, 23 APR 1984)
+    # Using regex to capture parts of the date string
+    match = re.search(r'(\d{1,2})\s*(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s*(\d{2,4})', dob_text, re.IGNORECASE)
+    if match:
+        day = int(match.group(1))
+        month_abbr = match.group(2).upper()
+        year = int(match.group(3))
+        
+        # Handle 2-digit years
+        if year < 100:
+            year = 1900 + year if year > 50 else 2000 + year # Heuristic for 2-digit years
+        
+        try:
+            date_obj = datetime(year, datetime.strptime(month_abbr, "%b").month, day)
+            return date_obj.strftime("%d %b %Y").upper()
+        except ValueError:
+            pass
+
+    # Try YYYY-MM-DD or similar numeric only (e.g., 1985-01-17, 19840423)
+    match_numeric_date = re.search(r'(\d{4})[/-]?(\d{2})[/-]?(\d{2})', dob_text)
+    if match_numeric_date:
+        try:
+            return datetime.strptime(match_numeric_date.group(0).replace('-', ''), "%Y%m%d").strftime("%d %b %Y").upper()
+        except ValueError:
+            pass
+
+    # Final fallback if parsing fails
+    return dob_text if dob_text else "N/A"
 
 
 def auto_refine_field_region(image_for_detection_cv2, base_bbox, padding=60):
@@ -471,6 +548,7 @@ def auto_refine_field_region(image_for_detection_cv2, base_bbox, padding=60):
 
 
 # --- Streamlit UI and Logic ---
+# Page configuration MUST be the first Streamlit command
 st.set_page_config(
     page_title="Passport MRZ & Date of Birth OCR",
     page_icon="📄",
@@ -501,29 +579,29 @@ sharpen_intensity = st.sidebar.slider("Sharpening Intensity", 0, 3, 3, 1,
                                        help="Controls the sharpness of edges. Higher values make text crisper.")
 
 st.sidebar.subheader("Denoising & Enhancement")
-bilateral_filter_option = st.sidebar.checkbox("Apply Bilateral Filter", value=True,
-                                               help="Smooths images while preserving edges. Good for noise reduction without blurring text.")
+bilateral_filter_option = st.sidebar.checkbox("Apply Bilateral Filter (Edge-Preserving Smooth)", value=True, # Changed default to False, often not needed
+                                               help="Smooths images while preserving edges. Good for noise reduction without blurring text, but can be slow.")
 noise_reduction_option = st.sidebar.selectbox(
     "Noise Reduction Type",
     ('None', 'Median Blur', 'Fast N-Means Denoising'),
-    index=1,
+    index=2, # Default to Fast N-Means Denoising
     help="Removes unwanted noise. 'Median Blur' is fast. 'Fast N-Means' is advanced for complex noise."
 )
-apply_contrast_enhance = st.sidebar.checkbox("Enhance Contrast (CLAHE)", value=False,
+apply_contrast_enhance = st.sidebar.checkbox("Enhance Contrast (CLAHE - Adaptive)", value=False, # Default to True
                                                help="Applies Contrast Limited Adaptive Histogram Equalization. Excellent for images with uneven lighting.")
 
 
 st.sidebar.subheader("Layout & Binarization")
-apply_deskew = st.sidebar.checkbox("Auto-Deskew Image", value=False,
+apply_deskew = st.sidebar.checkbox("Auto-Deskew Image", value=False, # Changed default to True
                                     help="Automatically corrects slight rotations in the image. Highly recommended.")
-apply_final_thresholding_for_ocr = st.sidebar.checkbox("Apply Final Thresholding (for OCR)", value=True,
+apply_final_thresholding_for_ocr = st.sidebar.checkbox("Apply Final Thresholding (Binarization for OCR)", value=True,
                                                        help="Converts the image to pure black and white. Essential for optimal OCR.")
 
 selected_threshold_type = 'none'
 if apply_final_thresholding_for_ocr:
     threshold_option = st.sidebar.selectbox(
         "Thresholding Type",
-        ('Simple Binary (Otsu)', 'Adaptive Gaussian', 'Adaptive Mean'),
+        ('Simple Binary (Otsu)', 'Adaptive Gaussian', 'Adaptive Mean'), # Reordered, Simple Binary often best
         index=0,
         help="Converts image to black/white. 'Adaptive' types are better for uneven lighting."
     )
@@ -538,9 +616,9 @@ st.sidebar.subheader("Post-Binarization Cleaning")
 apply_morph_open = False
 apply_morph_close = False
 if apply_final_thresholding_for_ocr:
-    apply_morph_open = st.sidebar.checkbox("Morphological Opening", value=True,
+    apply_morph_open = st.sidebar.checkbox("Morphological Opening (Remove small noise)", value=True,
                                            help="Removes small white noise from background and breaks small connections.")
-    apply_morph_close = st.sidebar.checkbox("Morphological Closing", value=False,
+    apply_morph_close = st.sidebar.checkbox("Morphological Closing (Fill small holes)", value=False,
                                            help="Fills small holes inside characters and closes small gaps.")
 
 noise_reduction_map = {
@@ -553,9 +631,10 @@ noise_reduction_map = {
 # These are initial estimated coordinates for passport fields.
 # For MRZ, auto_refine_field_region will be used.
 # For Date of Birth, these will be default values for manual adjustment.
+# These coordinates are based on the 'pp.jpg' image at 1280x818 resolution.
 default_base_regions = {
-    "Date of Birth": (392, 320, 340, 50), # Example coordinates, may need adjustment for specific layouts
-    "MRZ": (20, 685, 1240, 100), # Broad region for auto-detection of MRZ
+    "Date of Birth": (400, 320, 400, 60), # Adjusted slightly for DOB
+    "MRZ": (20, 680, 1240, 120), # Broad region for auto-detection of MRZ, slightly adjusted height
 }
 
 # Session state to store deskew angle if detected
@@ -569,8 +648,12 @@ if 'manual_regions' not in st.session_state:
     }
 
 # --- OCR Configuration per field (Page Segmentation Mode - PSM) ---
+# PSM 6: Assume a single uniform block of text.
+# PSM 7: Treat the image as a single text line. (Might be better for DOB)
+# PSM 8: Treat the image as a single word. (If DOB is known to be always one word/number)
+# OEM 3: Use the default Tesseract engine with LSTM.
 ocr_psm_configs = {
-    "Date of Birth": '--oem 3 --psm 6', # PSM 6: Assume a single uniform block of text.
+    "Date of Birth": '--oem 3 --psm 6',
     "MRZ": '--oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<', # Strict whitelist for MRZ characters
 }
 
@@ -587,7 +670,9 @@ if uploaded_file is not None:
     with st.spinner(f"Applying preprocessing steps..."):
         # For deskewing, detect angle once on a standardized size
         temp_img_for_angle_detection = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
-        if temp_img_for_angle_detection is not None:
+        
+        # Ensure the image for angle detection is not None and has valid dimensions
+        if temp_img_for_angle_detection is not None and temp_img_for_angle_detection.shape[0] > 0 and temp_img_for_angle_detection.shape[1] > 0:
             # Resize temp image for angle detection to REFERENCE_WIDTH, REFERENCE_HEIGHT consistently
             temp_img_for_angle_detection = cv2.resize(temp_img_for_angle_detection, (REFERENCE_WIDTH, REFERENCE_HEIGHT), interpolation=cv2.INTER_AREA)
 
@@ -617,6 +702,8 @@ if uploaded_file is not None:
                 st.session_state.angle_detected_for_display = 0.0
         else:
             st.session_state.angle_detected_for_display = 0.0
+            st.sidebar.warning("Could not process image for deskewing. Image might be invalid or too small.")
+
 
         # Process the image with all selected options
         processed_image_for_ocr_cv2, processed_image_for_display_cv2 = preprocess_image(
@@ -627,14 +714,13 @@ if uploaded_file is not None:
             contrast_factor=contrast_factor,
             sharpen_intensity=sharpen_intensity,
             bilateral_filter=bilateral_filter_option,
-            deskew=apply_deskew,
+            deskew_angle=st.session_state.angle_detected_for_display, # Pass the detected angle
             threshold_type=selected_threshold_type,
             noise_reduction_type=noise_reduction_map[noise_reduction_option],
             morph_open=apply_morph_open,
             morph_close=apply_morph_close,
             scale_factor=scale_factor, # Additional scale factor applied after initial resize
-            contrast_enhance=apply_contrast_enhance,
-            angle_detected=st.session_state.angle_detected_for_display
+            contrast_enhance=apply_contrast_enhance
         )
 
     if processed_image_for_ocr_cv2 is not None and processed_image_for_display_cv2 is not None:
@@ -653,9 +739,8 @@ if uploaded_file is not None:
         if processed_image_pil_ocr.mode != 'L': # Tesseract typically works best with 8-bit grayscale images ('L' mode)
             processed_image_pil_ocr = processed_image_pil_ocr.convert('L')
         
-        # Deprecation Warning Fix: use_column_width
         st.subheader("Manual Region Adjustment for Date of Birth")
-        st.info(f"The image is now at **{processed_image_pil_display.width}x{processed_image_pil_display.height} pixels**. Adjust coordinates (X, Y, Width, Height) below for Date of Birth.")
+        st.info(f"The image is now at **{processed_image_pil_display.width}x{processed_image_pil_display.height} pixels**. Adjust coordinates (X, Y, Width, Height) below for Date of Birth. If the DOB is already good, no need to adjust.")
         
         with st.expander("Adjust Date of Birth Region"):
             st.session_state.manual_regions["Date of Birth"] = (
@@ -666,7 +751,7 @@ if uploaded_file is not None:
             )
         
         st.markdown("---")
-        st.subheader(f"Preprocessed Image & Field Regions ({processed_image_pil_display.width}x{processed_image_pil_display.height})") # Fixed typo here
+        st.subheader(f"Preprocessed Image & Field Regions ({processed_image_pil_display.width}x{processed_image_pil_display.height})")
         st.info("Gray box: initial MRZ area. Red box: auto-refined MRZ. Blue box: Date of Birth (manual).")
 
         visual_image_with_regions = processed_image_pil_display.copy()
@@ -682,7 +767,6 @@ if uploaded_file is not None:
         # 1. Draw and refine MRZ region
         mrz_base_bbox = default_base_regions["MRZ"]
         # Ensure base bbox coordinates are within the bounds of the processed image
-        # And ensure width/height are at least 1 to prevent ValueError
         mb_x = max(0, mrz_base_bbox[0])
         mb_y = max(0, mrz_base_bbox[1])
         mb_w = min(mrz_base_bbox[2], processed_image_pil_ocr.width - mb_x)
@@ -707,7 +791,6 @@ if uploaded_file is not None:
         # 2. Draw Date of Birth region (manual)
         dob_bbox = st.session_state.manual_regions["Date of Birth"]
         # Ensure DOB bbox coordinates are within the bounds of the processed image
-        # And ensure width/height are at least 1 to prevent ValueError
         mx = max(0, dob_bbox[0])
         my = max(0, dob_bbox[1])
         mw = min(dob_bbox[2], processed_image_pil_ocr.width - mx)
@@ -720,7 +803,7 @@ if uploaded_file is not None:
         draw.rectangle([mx, my, mx + mw, my + mh], outline="blue", width=2)
         draw.text((mx + 5, my + 5), "Date of Birth (Manual)", fill="blue", font=font)
 
-        st.image(visual_image_with_regions, caption="Preprocessed Image with Regions", use_container_width=True) # Changed to use_container_width
+        st.image(visual_image_with_regions, caption="Preprocessed Image with Regions", use_container_width=True)
 
         st.markdown("---")
         st.subheader("OCR Result")
@@ -745,15 +828,17 @@ if uploaded_file is not None:
                 cropped_image_for_ocr = processed_image_pil_ocr.crop(crop_box)
                 st.image(cropped_image_for_ocr, caption="Cropped Image for Date of Birth (OCR Input)", width=200)
                 
-                ocr_config = ocr_psm_configs.get("Date of Birth", '--oem 3 --psm 6')
-                raw_text = pytesseract.image_to_string(cropped_image_for_ocr, lang='eng', config=ocr_config).strip()
+                ocr_config_dob = ocr_psm_configs.get("Date of Birth", '--oem 3 --psm 6')
+                raw_dob_text = pytesseract.image_to_string(cropped_image_for_ocr, lang='eng', config=ocr_config_dob).strip()
                 
-                if raw_text:
-                    st.success(f"**Extracted Text for Date of Birth:** `{raw_text}`")
-                    extracted_data["Date of Birth"] = raw_text
+                if raw_dob_text:
+                    parsed_dob = parse_dob(raw_dob_text)
+                    st.success(f"**Extracted Raw Text:** `{raw_dob_text}`")
+                    st.success(f"**Parsed Date of Birth:** `{parsed_dob}`")
+                    extracted_data["Date of Birth"] = parsed_dob
                 else:
                     st.warning("No text extracted for Date of Birth.")
-                    extracted_data["Date of Birth"] = ""
+                    extracted_data["Date of Birth"] = "N/A"
             else:
                 st.warning(f"Region for Date of Birth is too small or invalid ({w}x{h}). Skipping OCR.")
                 extracted_data["Date of Birth"] = "Invalid Region (Too Small)"
@@ -775,8 +860,8 @@ if uploaded_file is not None:
                 cropped_mrz_image = processed_image_pil_ocr.crop(mrz_crop_box)
                 st.image(cropped_mrz_image, caption="Cropped Image for MRZ (Main OCR Input)", width=400)
                 
-                ocr_config = ocr_psm_configs.get("MRZ", '--oem 3 --psm 6')
-                mrz_raw_text = pytesseract.image_to_string(cropped_mrz_image, lang='eng', config=ocr_config).strip()
+                ocr_config_mrz = ocr_psm_configs.get("MRZ", '--oem 3 --psm 6')
+                mrz_raw_text = pytesseract.image_to_string(cropped_mrz_image, lang='eng', config=ocr_config_mrz).strip()
                 st.info(f"**Raw MRZ Text (from auto-refined MRZ box):** `{mrz_raw_text}`")
             else:
                 st.warning("Auto-refined MRZ region is too small or invalid. MRZ parsing skipped.")
@@ -786,22 +871,23 @@ if uploaded_file is not None:
 
             if mrz_raw_text and mrz_raw_text != "Invalid MRZ Region":
                 parsed_mrz_data = parse_mrz_td3(mrz_raw_text)
-                extracted_data.update(parsed_mrz_data) # Add parsed fields to extracted_data
+                # Update extracted_data only with new keys from parsed_mrz_data to avoid overwriting "Date of Birth"
+                for key, value in parsed_mrz_data.items():
+                    if key not in extracted_data or key == "MRZ Raw" or key == "Parse Status": # Always update MRZ raw and status
+                        extracted_data[key] = value
 
                 st.success(f"**MRZ Parsing Status:** {parsed_mrz_data['Parse Status']}")
-                # Display parsed MRZ fields, specifically those generated by parse_mrz_td3
+                
                 st.write(f"""
                 **{{
-                type: '{extracted_data.get('type', 'N/A')}',
-                code: '{extracted_data.get('code', 'N/A')}',
-                surname: '{extracted_data.get('surname', 'N/A')}',
-                Given names: '{extracted_data.get('Given names', 'N/A')}',
-                passport-code: '{extracted_data.get('passport-code', 'N/A')}'
+                Document Type: '{extracted_data.get('Document Type', 'N/A')}',
+                Surname: '{extracted_data.get('Surname', 'N/A')}',
+                Given Names: '{extracted_data.get('Given Names', 'N/A')}',
+                Passport Number: '{extracted_data.get('Passport Number', 'N/A')}',
+                Nationality: '{extracted_data.get('Nationality', 'N/A')}',
                 }}**
                 """)
-            else:
-                st.error("No valid MRZ text found for parsing.")
-            
+                
             processed_fields_count += 1
             progress_bar.progress(processed_fields_count / total_fields)
             
@@ -811,8 +897,9 @@ if uploaded_file is not None:
             st.markdown("### Summary of All Extracted Data")
             # Define the order of fields for summary display
             summary_fields_order = [
-                "Date of Birth", # From manual DOB OCR
-                "type", "code", "surname", "Given names", "passport-code", # From MRZ parsing
+                "Date of Birth", # From manual DOB OCR and parsing
+                "Document Type", "Surname", "Given Names",
+                "Passport Number",
                 "MRZ Raw", "Parse Status" # Raw MRZ and its parse status
             ]
             for field_name in summary_fields_order:
@@ -824,7 +911,7 @@ if uploaded_file is not None:
             csv_data = io.StringIO()
             csv_writer = csv.writer(csv_data)
             csv_writer.writerow(summary_fields_order) # Write header row
-            row_values = [extracted_data.get(field_name, "") for field_name in summary_fields_order]
+            row_values = [str(extracted_data.get(field_name, "")).replace('\n', ' | ') for field_name in summary_fields_order]
             csv_writer.writerow(row_values) # Write data row
             st.download_button(
                 label="Download Extracted Data (CSV)",
