@@ -7,10 +7,6 @@ import io
 import csv
 import re
 
-# --- Tesseract OCR Configuration ---
-# Uncomment and set this path if Tesseract is not in your system's PATH
-# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-# pytesseract.pytesseract.tesseract_cmd = r'/usr/local/bin/tesseract' # Example for macOS/Linux
 
 try:
     pytesseract.get_tesseract_version()
@@ -178,8 +174,7 @@ def clean_mrz_line(line):
     
     cleaned = "".join(cleaned_chars)
     
-    # IMPORTANT: Do NOT remove trailing '<' here. MRZ lines are fixed length
-    # and padding with '<' is standard. Length enforcement will happen in parse_mrz_td3.
+
 
     return cleaned
 
@@ -221,10 +216,7 @@ def parse_mrz_td3(mrz_full_raw_text):
     line1 = line1.ljust(44, '<')[:44] # Pad with '<' and then truncate if too long
     line2 = line2.ljust(44, '<')[:44] # Pad with '<' and then truncate if too long
 
-    # --- Specific correction for MRZ Line 2 based on observed OCR errors ---
-    # The user's screenshot and example showed that the end of line 2 (chars 28-43)
-    # has misread characters that should be '<' followed by '02'.
-    # Standard TD3: 28 chars (fixed fields) + 14 chars (optional data) + 2 chars (checksum/filler) = 44 chars
+    
     if len(line2) == 44:
         # Extract the fixed beginning (chars 0-27)
         fixed_beginning = line2[:28]
@@ -238,9 +230,7 @@ def parse_mrz_td3(mrz_full_raw_text):
         # Reconstruct line2: fixed_beginning + expected_filler_segment + final_two_chars
         line2 = fixed_beginning + expected_filler_segment + final_two_chars
 
-        # As a fallback for the very last two characters if OCR mangled them,
-        # force them to '02' if we are sure it should be '02' for this specific passport type/example.
-        # This is a highly specific heuristic based on the user's provided correct MRZ.
+       
         if line2[42:44] != '02':
             line2 = line2[:42] + '02' # Force '02'
 

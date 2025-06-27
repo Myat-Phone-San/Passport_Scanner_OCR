@@ -8,16 +8,6 @@ import csv
 import re # For regex in MRZ parsing
 from collections import defaultdict # For grouping detected words
 
-# --- Tesseract OCR Configuration ---
-# IMPORTANT: This path is set for a typical Windows Tesseract installation.
-# If Tesseract is installed elsewhere (e.g., 'C:\Tesseract-OCR\tesseract.exe'),
-# or you are on macOS/Linux, please adjust this path accordingly.
-# For example, on macOS/Linux, it's often in your PATH (so you might not need this line),
-# or could be set to '/usr/local/bin/tesseract'.
-# For deployment, consider using environment variables to manage this path dynamically.
-# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe' # Uncomment and set this path if Tesseract is not in your system's PATH
-
-# Check if Tesseract is accessible
 try:
     # Attempt to get Tesseract version to confirm executable path is correct
     pytesseract.get_tesseract_version()
@@ -382,9 +372,7 @@ def auto_detect_field_regions(image_pil_ocr):
         if found_label_bbox:
             lx, ly, lw, lh = found_label_bbox
             
-            # Guessed value region: Starts immediately to the right of the label,
-            # extends to near the right edge of the image, and has similar height to the label.
-            # This broader initial guess allows auto_refine_field_region to find actual text.
+            
             initial_guess_x = lx + lw + 10 # Start 10px to the right of the label
             initial_guess_y = ly - 5 # A little above the label for robustness
             initial_guess_width = img_width - initial_guess_x - 20 # Almost to the right edge, with some margin
