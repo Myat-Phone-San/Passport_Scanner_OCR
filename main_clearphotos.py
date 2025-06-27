@@ -232,6 +232,7 @@ def parse_mrz_td3(mrz_full_raw_text):
         "MRZ Raw": mrz_full_raw_text,
         "Parse Status": "Failed",
         "Document Type": "N/A",
+        "Code": "N/A",
         "Surname": "N/A",
         "Given Names": "N/A",
         "Passport Number": "N/A",
@@ -263,6 +264,8 @@ def parse_mrz_td3(mrz_full_raw_text):
     try:
         # Line 1 Parsing
         parsed_data["Document Type"] = line1[0]
+        parsed_data["code"] = line1[2:5].replace('<', '').strip().ljust(3, '<')[:3]
+        
 
 
         name_segment = line1[5:44]
@@ -296,7 +299,7 @@ def parse_mrz_td3(mrz_full_raw_text):
         if all(field not in ["N/A", "", "<", "<<", "<<<"] for field in essential_fields):
             parsed_data["Parse Status"] = "Success"
         else:
-            missing_fields = [k for k, v in parsed_data.items() if k in ["Document Type", "Surname", "Passport Number"] and v in ["N/A", "", "<", "<<", "<<<"]]
+            missing_fields = [k for k, v in parsed_data.items() if k in ["Document Type", "Code", "Surname", "Passport Number"] and v in ["N/A", "","", "<", "<<", "<<<"]]
             if missing_fields:
                 parsed_data["Parse Status"] = f"Partial Success: Missing/Empty core fields: {', '.join(missing_fields)}"
             else:
@@ -633,7 +636,7 @@ noise_reduction_map = {
 # For Date of Birth, these will be default values for manual adjustment.
 # These coordinates are based on the 'pp.jpg' image at 1280x818 resolution.
 default_base_regions = {
-    "Date of Birth": (400, 320, 400, 60), # Adjusted slightly for DOB
+    "Date of Birth": (400, 317, 400, 60), # Adjusted slightly for DOB
     "MRZ": (20, 680, 1240, 120), # Broad region for auto-detection of MRZ, slightly adjusted height
 }
 
@@ -881,6 +884,7 @@ if uploaded_file is not None:
                 st.write(f"""
                 **{{
                 Document Type: '{extracted_data.get('Document Type', 'N/A')}',
+                code: '{extracted_data.get('code', 'N/A')}',
                 Surname: '{extracted_data.get('Surname', 'N/A')}',
                 Given Names: '{extracted_data.get('Given Names', 'N/A')}',
                 Passport Number: '{extracted_data.get('Passport Number', 'N/A')}',
@@ -898,7 +902,7 @@ if uploaded_file is not None:
             # Define the order of fields for summary display
             summary_fields_order = [
                 "Date of Birth", # From manual DOB OCR and parsing
-                "Document Type", "Surname", "Given Names",
+                "Document Type", "code", "Surname", "Given Names",
                 "Passport Number",
                 "MRZ Raw", "Parse Status" # Raw MRZ and its parse status
             ]
